@@ -4,352 +4,144 @@
 
 ---
 
-## The Problem This Solves
+## 🎯 What Problem Does It Solve?
 
-Every company shipping LLMs in production is flying blind.
+Every company shipping LLMs in production is flying blind. A prompt that scores 92% accuracy today can silently degrade to 61% after a model provider pushes an update. A RAG pipeline that retrieves the right chunks can still hallucinate by blending in parametric knowledge the retriever never returned. 
 
-A prompt that scores 92% accuracy today can silently degrade to 61% after a model provider pushes an update. A RAG pipeline that retrieves the right chunks can still hallucinate by blending in parametric knowledge the retriever never returned. A summarization prompt that works perfectly in English falls apart on financial jargon — and nobody knows until a customer complains.
+This framework acts as a **systematic, automated quality gate** that runs before failures reach users. It replaces reactive user-ticket bug discovery with proactive, automated regression testing. 
 
-There is no compiler for LLM output. No linter. No unit test suite that catches semantic regressions automatically. Teams typically discover quality failures through user tickets, not monitoring.
-
-This framework is that missing layer: a systematic, automated quality gate that runs before failures reach users.
-
-**Concrete outcome:** In internal tests simulating a 30-prompt regression suite against a model provider update, the framework surfaced a 14-point faithfulness drop (0.81 → 0.67) in a RAG pipeline within 4 minutes of the update going live — compared to an estimated 2–3 days for human reviewers to notice the same degradation through support volume.
+* **Concrete Outcome:** Reduced quality regression detection time from an estimated 2–3 days (via human review) to under 4 minutes by automatically flagging a 14-point faithfulness drop in a RAG pipeline immediately after a simulated model update.
 
 ---
 
-## What It Does
+## ✨ Pros & Key Features
 
-The framework accepts a test case — a prompt, the LLM that should answer it, optional RAG context, and a reference answer — then runs it through up to four evaluators in parallel, stores every score in PostgreSQL, and surfaces trends, regressions, and alerts on a live Streamlit dashboard.
-
-```
-Submit test case → LLM generates response → 4 evaluators score it → Results stored → Dashboard alerts
-```
-
-Each evaluator answers a different question:
-
-| Evaluator | Question it answers | When to use |
-|---|---|---|
-| **LLM-as-Judge** | Is this output high quality overall? | Every LLM product |
-| **Hallucination Detector** | Did the model fabricate facts? | Any response with verifiable claims |
-| **Faithfulness Scorer** | Did the RAG model stay within retrieved context? | RAG pipelines exclusively |
-| **Consistency Checker** | Does the model give stable answers across runs? | Production, before shipping a prompt |
+- **Automated Quality Gates:** Intercept LLM failures before they reach your users.
+- **Parallel Evaluators:** Process multiple evaluation metrics (Judge, Hallucination, Faithfulness, Consistency) simultaneously.
+- **Real-time Observability:** A built-in Streamlit dashboard surfaces score trends, pass/fail results, and regressions.
+- **Asynchronous Execution:** High-throughput task processing pipeline utilizing FastAPI, Celery, and PostgreSQL ensures your API event loop is never blocked.
+- **CI/CD Ready:** Easily wire into GitHub Actions to fail PRs if prompt scores drop below thresholds.
 
 ---
 
-## Architecture
+## 🏗️ Architecture Flow Diagram
 
-```
-                        ┌─────────────────────────────────────────┐
-                        │           CLIENT / CI PIPELINE           │
-                        │   curl · pytest · GitHub Actions · UI    │
-                        └────────────────┬────────────────────────┘
-                                         │  POST /api/test-cases
-                                         ▼
-                        ┌─────────────────────────────────────────┐
-                        │              FastAPI (async)             │
-                        │                                          │
-                        │  /api/test-cases   ─── validates input   │
-                        │  /api/results      ─── returns scores    │
-                        │  /api/dashboard/*  ─── aggregations      │
-                        └──────────┬──────────────────────────────┘
-                                   │  writes TestCase (status=pending)
-                                   │  enqueues  eval_task.delay(id)
-                          ┌────────▼────────┐
-                          │   PostgreSQL     │
-                          │                 │  ◄── persistent store for
-                          │  test_cases     │      all test cases,
-                          │  eval_results   │      scores, and trends
-                          └────────▲────────┘
-                                   │  reads/writes
-                        ┌──────────┴──────────────────────────────┐
-                        │          Celery Worker (async)           │
-                        │                                          │
-                        │  1. calls target LLM (Claude/GPT-4o)    │
-                        │  2. runs configured evaluators           │
-                        │  3. persists EvalResult                  │
-                        │  4. fires Slack alert on regression      │
-                        └──────────┬──────────────────────────────┘
-                                   │  task messages
-                        ┌──────────▼──────────────────────────────┐
-                        │              Redis                       │
-                        │  broker (task queue) + result backend    │
-                        └─────────────────────────────────────────┘
-
-                        ┌─────────────────────────────────────────┐
-                        │           Evaluation Engine              │
-                        │                                          │
-                        │  ┌─────────────┐  ┌──────────────────┐  │
-                        │  │  LLMJudge   │  │  Hallucination   │  │
-                        │  │  (Claude/   │  │  Detector        │  │
-                        │  │   GPT-4o)   │  │  (LLM NLI)       │  │
-                        │  └─────────────┘  └──────────────────┘  │
-                        │  ┌─────────────┐  ┌──────────────────┐  │
-                        │  │ Faithfulness│  │  Consistency     │  │
-                        │  │ Scorer      │  │  Checker         │  │
-                        │  │ (RAG only)  │  │  (N-run cosine)  │  │
-                        │  └─────────────┘  └──────────────────┘  │
-                        │                                          │
-                        │  All evaluators extend BaseEvaluator.    │
-                        │  Output: EvalResult(score, passed,       │
-                        │          explanation, metadata)          │
-                        └─────────────────────────────────────────┘
-
-                        ┌─────────────────────────────────────────┐
-                        │        Streamlit Dashboard               │
-                        │                                          │
-                        │  📈 Score trends (Plotly line chart)     │
-                        │  📋 Results table with filters           │
-                        │  ⚠️  Regression alerts (score drops)     │
-                        │  🚀 Test case submission form            │
-                        └─────────────────────────────────────────┘
-```
-
-### Request lifecycle (numbered)
-
-1. Client POSTs a test case to FastAPI — prompt, LLM name, evaluators to run, optional RAG context and reference answer
-2. FastAPI validates with Pydantic, writes `TestCase` to PostgreSQL with `status=pending`, returns `201` immediately
-3. FastAPI enqueues `run_evaluation.delay(test_case_id)` to Redis — the HTTP response is already sent; the caller does not wait
-4. A Celery worker picks up the job, calls the configured LLM with `httpx.AsyncClient`, captures response + latency + token count
-5. Worker passes the LLM response to each configured evaluator sequentially; each returns a `(score, explanation, metadata)` tuple
-6. All scores are written to `eval_results` in PostgreSQL; test case status flips to `completed`
-7. If any evaluator fails its threshold and Slack is configured, a webhook alert fires
-8. Streamlit polls the dashboard endpoints every 30 seconds and re-renders; regression alerts appear automatically
-
----
-
-## Tech Stack
-
-| Layer | Technology | Why this, not the alternative |
-|---|---|---|
-| API | **FastAPI** | Native async, automatic OpenAPI docs, Pydantic integration. Flask would require manual schema wiring. |
-| Validation | **Pydantic v2** | 2–5× faster than v1 for hot-path request validation |
-| Database ORM | **SQLAlchemy 2.0 async** | Modern `mapped_column` style, full async support. Peewee and Tortoise lack the ecosystem. |
-| DB driver | **asyncpg** | Pure-async PostgreSQL driver, 3–5× faster than psycopg2 in async contexts |
-| Migrations | **Alembic** | De-facto standard for SQLAlchemy; auto-generates diffs from model changes |
-| Task queue | **Celery + Redis** | Industry-standard for long-running background jobs with retries, scheduling, and fanout |
-| HTTP client | **httpx** | Async-native, connection pooling, drop-in requests API. aiohttp has a less ergonomic interface. |
-| Dashboard | **Streamlit + Plotly** | Zero-JS dashboard in pure Python, production-quality interactive charts |
-| Containerisation | **Docker Compose** | Five-service local environment in one command |
-
----
-
-## Project Structure
-
-```
-llm-eval-framework/
-├── src/
-│   ├── config.py                   # Pydantic settings — single source of truth for all env vars
-│   ├── api/
-│   │   ├── main.py                 # FastAPI app + lifespan (DB init, CORS)
-│   │   ├── deps.py                 # Reusable dependencies: DBSession, APIKey
-│   │   ├── schemas.py              # All Pydantic request/response models
-│   │   └── routers/
-│   │       ├── test_cases.py       # POST/GET/DELETE /api/test-cases
-│   │       ├── results.py          # GET /api/results
-│   │       └── dashboard.py        # GET /api/dashboard/{summary,trends,regressions}
-│   ├── database/
-│   │   ├── models.py               # SQLAlchemy ORM — TestCase + EvalResult
-│   │   └── engine.py               # Async engine, session factory, init_db()
-│   ├── evaluators/
-│   │   ├── base.py                 # Abstract BaseEvaluator + EvalResult dataclass
-│   │   ├── llm_judge.py            # LLM-as-judge (Claude/GPT-4o, 1–5 rubric)
-│   │   ├── hallucination.py        # Claim-level NLI via judge LLM
-│   │   ├── faithfulness.py         # RAG context grounding check
-│   │   ├── consistency.py          # N-run similarity (cosine or Jaccard fallback)
-│   │   └── registry.py             # get_evaluator("name") factory
-│   ├── llm_clients/
-│   │   ├── base.py                 # Abstract BaseLLMClient + LLMResponse dataclass
-│   │   ├── anthropic_client.py     # Anthropic Claude via REST
-│   │   ├── openai_client.py        # OpenAI GPT-4o via REST
-│   │   └── registry.py             # get_llm_client("claude"|"openai") factory
-│   ├── workers/
-│   │   ├── celery_app.py           # Celery configuration (broker, serialiser, limits)
-│   │   └── tasks.py                # run_evaluation task + async eval pipeline
-│   └── dashboard/
-│       └── app.py                  # Streamlit UI — 4 tabs, cached data, submit form
-├── alembic/                        # Database migration scripts
-├── tests/
-│   ├── conftest.py                 # SQLite in-memory fixtures, test client
-│   └── test_evaluators.py          # Unit tests for all evaluators + registry
-├── docker-compose.yml              # postgres + redis + api + worker + dashboard
-├── Dockerfile
-├── requirements.txt
-├── pyproject.toml                  # pytest config + ruff lint rules
-└── .env.example
+```mermaid
+graph TD
+    Client(Client / CI Pipeline \n curl, pytest, UI) -->|POST /api/test-cases| API(FastAPI Async Server)
+    
+    subgraph Core API
+        API -->|1. Validates & Writes pending status| DB[(PostgreSQL \n test_cases, eval_results)]
+        API -->|2. Enqueues Task| Queue[(Redis Broker)]
+        API -.->|Polls for /api/results| Dashboard(Streamlit Dashboard)
+    end
+    
+    subgraph Background Processing
+        Worker(Celery Worker) -->|3. Pulls Task| Queue
+        Worker -->|4. Calls API| TargetLLM((Target LLM \n Claude/GPT-4o))
+        Worker -->|5. Runs Evaluators sequentially| EvalEngine[[Evaluation Engine]]
+    end
+    
+    subgraph Evaluation Evaluators
+        EvalEngine --> Judge[LLM-as-Judge]
+        EvalEngine --> Hallucination[Hallucination Detector]
+        EvalEngine --> Faithfulness[Faithfulness Scorer]
+        EvalEngine --> Consistency[Consistency Checker]
+    end
+    
+    EvalEngine -->|6. Writes EvalResult| DB
+    EvalEngine -.->|7. Fires Alert on drop| Slack{Slack Webhook}
+    Dashboard -->|8. Visualizes / Alerts| DB
 ```
 
 ---
 
-## Functionality
+## 🔄 Communication Between Files (Request Lifecycle)
 
-### Evaluators in detail
-
-**LLM-as-Judge**
-Uses a stronger model (Claude Haiku or GPT-4o-mini) to score the response across five dimensions on a 1–5 rubric: accuracy, relevance, completeness, clarity, and safety. The prompt is engineered to return structured JSON — no prose — so parse failures are deterministic. Scores are normalised to 0.0–1.0. A `PASS / REVIEW / FAIL` recommendation is included in the metadata.
-
-**Hallucination Detector**
-Breaks the LLM response into individual factual claims and asks the judge model to classify each one as `SUPPORTED`, `UNSUPPORTED`, or `CONTRADICTED` against a reference document. The final score is `1.0 − hallucination_rate`. Requires a `reference_answer` or `context` field on the test case. Skips gracefully with a neutral score if neither is present.
-
-**Faithfulness Scorer**
-Designed exclusively for RAG pipelines. Faithfulness and hallucination answer different questions: a response can be 100% faithful (only uses the retrieved chunks) yet still be factually wrong (because the retriever returned bad chunks). This evaluator measures whether the model stayed within the retrieved context — it catches "context leakage" where the model supplements the retriever with parametric memory. Requires `context`.
-
-**Consistency Checker**
-Runs the same prompt N times (default: 5) at temperature 0.7 and measures pairwise similarity across all responses. If `sentence-transformers` is installed, it uses all-MiniLM-L6-v2 cosine similarity. Otherwise it falls back to token-level Jaccard — no required dependencies. Extra runs are dispatched concurrently with `asyncio.gather`. A mean similarity below 0.85 flags the prompt as unreliable.
-
-### API endpoints
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/test-cases` | Submit a test case, trigger evaluation |
-| `GET` | `/api/test-cases` | List with filters: status, llm, prompt_type |
-| `GET` | `/api/test-cases/{id}` | Full detail including context and reference |
-| `POST` | `/api/test-cases/{id}/run` | Re-evaluate (e.g. after prompt change) |
-| `DELETE` | `/api/test-cases/{id}` | Remove test case and all results |
-| `GET` | `/api/results` | List results with filters: passed, test_case_id |
-| `GET` | `/api/results/{id}` | Full result with all evaluator scores |
-| `GET` | `/api/dashboard/summary` | Aggregate: pass rate, avg latency, avg judge score |
-| `GET` | `/api/dashboard/trends` | Per-evaluator score time series |
-| `GET` | `/api/dashboard/regressions` | Test cases with score drops ≥ threshold |
-| `GET` | `/api/dashboard/health` | DB connectivity check |
-| `GET` | `/health` | API liveness |
-
-All endpoints except `/health` require `X-API-Key` header.
-
-### Dashboard tabs
-
-- **Trends** — Plotly line chart of evaluator scores over time, filterable by model and time window. Red dashed line at the configured threshold.
-- **Results** — Paginated table of evaluation results with pass/fail, latency, token count.
-- **Regressions** — Expandable cards for every test case where the latest score dropped more than 0.1 vs the previous run. Shows both scores and the evaluator's explanation.
-- **Submit** — Form to create a new test case without touching the API directly.
+1. **Client POSTs a test case** to the FastAPI app (`src/api/routers/test_cases.py`) — passing a prompt, LLM name, evaluators to run, and optional RAG context/reference answer.
+2. **FastAPI (`src/api/main.py`) validates** the payload using Pydantic (`src/api/schemas.py`), writes a `TestCase` to PostgreSQL (`src/database/models.py`) with `status=pending`, and returns a `201` status immediately.
+3. **Task Queuing:** FastAPI enqueues `run_evaluation.delay(test_case_id)` to Redis via Celery (`src/workers/tasks.py`) — the HTTP response is already sent, so the caller doesn't wait.
+4. **Worker Execution:** A Celery worker picks up the job, natively calls the configured LLM using `httpx.AsyncClient` from the `llm_clients` registry, and captures the response, latency, and token count.
+5. **Evaluation Engine:** The worker passes the LLM response to each selected evaluator (`src/evaluators/base.py`) sequentially. Each evaluator returns a `(score, explanation, metadata)` tuple.
+6. **Persisting Results:** All scores are written back to the `eval_results` table in PostgreSQL; the test case status flips to `completed`.
+7. **Alerts & Dashboards:** If an evaluator fails its threshold, a Slack webhook alert fires. Meanwhile, Streamlit (`src/dashboard/app.py`) polls the API endpoints every 30 seconds to render regression alerts and score trends.
 
 ---
 
-## Design Decisions
+## 💻 Tech Stack
 
-### 1. LLM-based hallucination vs. local NLI model
-
-**Option A — Local cross-encoder/nli-deberta-v3-base**
-The document this project is based on uses a 400 MB local transformer model loaded into the worker process. It runs entirely offline and costs nothing per call.
-
-**Option B — LLM-as-judge NLI (chosen)**
-The judge LLM reads the reference text and each claim, then classifies them. No local model, no PyTorch dependency, no 400 MB download, no GPU requirement.
-
-**Why B:** The compute cost of loading a 400 MB model into every Celery worker is prohibitive on standard instances. More importantly, the judge LLM produces richer output — it extracts exact evidence quotes and provides a `CONTRADICTED` classification that local NLI collapses to `neutral`. The API cost for a typical eval (10 claims, Claude Haiku) is approximately $0.001 — negligible compared to worker memory.
-
-The local NLI approach is still available: install `transformers` and `torch`, set `use_local_nli=True` in config, and the detector switches automatically. This lets resource-constrained teams trade accuracy for zero API costs.
+- **API Layer:** FastAPI, Pydantic v2
+- **Database & ORM:** PostgreSQL, SQLAlchemy 2.0 (async), asyncpg, Alembic
+- **Task Queue & Background Jobs:** Celery, Redis
+- **HTTP Client:** `httpx` (async-native connection pooling)
+- **Frontend Dashboard:** Streamlit, Plotly
+- **Containerization:** Docker Compose
 
 ---
 
-### 2. Celery workers vs. FastAPI background tasks
+## 🧠 LLM Models Used
 
-**Option A — FastAPI `BackgroundTasks`**
-Simple, no additional infrastructure. The task runs in the same process as the API.
+The framework supports API-based judges and optional local ML models.
 
-**Option B — Celery + Redis (chosen)**
+### API-Based Judges
+- **Claude Haiku** (`claude-haiku-4-5-20251001`): Default judge model for LLM-as-a-Judge and Hallucination Detector (highly cost-efficient).
+- **GPT-4o-mini**: Supported alternative lightweight judge model.
+- **Claude / GPT-4o**: Supported for maximum evaluation accuracy.
 
-**Why B:** Evaluation runs take 10–30 seconds per test case, especially when running the consistency checker (N LLM calls) or multiple evaluators. FastAPI background tasks run in the same event loop as the API — a slow task delays other requests. Celery workers are separate processes that scale independently: add more workers to handle more concurrent evaluations without touching the API. Celery also provides automatic retries with exponential backoff when LLM APIs rate-limit — critical for any production workload.
-
----
-
-### 3. Async SQLAlchemy + asyncpg vs. sync SQLAlchemy + psycopg2
-
-**Option A — Sync SQLAlchemy (psycopg2)**
-Simpler setup, works in Celery workers natively, broad community examples.
-
-**Option B — Async SQLAlchemy 2.0 + asyncpg (chosen)**
-
-**Why B:** The FastAPI layer is fully async. A sync database driver would block the event loop on every query — one slow query stalls all concurrent API requests. `asyncpg` is 3–5× faster than psycopg2 in async contexts because it speaks the PostgreSQL wire protocol natively without DBAPI2 overhead. For Celery workers, `asyncio.run()` wraps the async pipeline cleanly — one new event loop per task, which is correct behaviour for isolated background jobs.
+### Optional Local Models
+Bypass LLM API limits and costs by installing `transformers` and `torch`:
+- **`nli-deberta-v3-base`** (400 MB): Local cross-encoder model for Hallucination Detection instead of an LLM judge.
+- **`all-MiniLM-L6-v2`** (80 MB): Local `sentence-transformers` model used for cosine semantic similarity in the Consistency Checker.
 
 ---
 
-### 4. Sentence-transformers vs. Jaccard for consistency scoring
+## ⚙️ System Requirements
 
-**Option A — sentence-transformers (all-MiniLM-L6-v2)**
-80 MB model. Captures semantic similarity — "The capital of France is Paris" and "Paris serves as France's capital" score ~0.97. Ideal for detecting semantic drift.
-
-**Option B — Token Jaccard (chosen as default, with A as optional enhancement)**
-Zero dependencies. O(n) set intersection. "The capital of France is Paris" vs "Paris serves as France's capital" scores ~0.33 — penalises word order changes even when meaning is identical.
-
-**Why default to B:** The majority of consistency failures are not subtle semantic shifts — they are factual instability (the model says 2024 in one run and 2023 in another) or structural instability (bullet list vs. paragraph). Jaccard catches both. sentence-transformers is available as a drop-in upgrade: install it, and the `ConsistencyChecker` detects it automatically via a lazy import. This keeps the default Docker image under 800 MB.
-
----
-
-### 5. One schemas.py vs. per-router schema files
-
-**Option A — Separate schema files per router**
-Scales better as the schema surface grows; easier to navigate for large teams.
-
-**Option B — Single schemas.py (chosen)**
-
-**Why B:** At the current scale (4 evaluators, 3 routers, ~10 schema classes), a single file is faster to navigate and avoids circular imports between routers that share response types. The grouping within the file (`TestCase`, `EvalResult`, `Dashboard`) provides the same logical separation without filesystem overhead.
-
----
-
-## Use Cases
-
-### 1. Prompt regression testing in CI/CD
-Wire the framework into GitHub Actions. Before merging a prompt change, run the full test suite against staging. Fail the PR if any score drops below the configured threshold. The `/api/test-cases/{id}/run` endpoint supports re-evaluation so the same test cases run against every candidate prompt version.
-
-### 2. RAG pipeline quality assurance
-After building a retriever, run a set of golden questions through the pipeline and score faithfulness. If faithfulness drops below 0.8, the retriever is returning off-topic chunks. If hallucination is high despite high faithfulness, the source documents contain errors.
-
-### 3. Model provider update monitoring
-When Anthropic or OpenAI pushes a model update, run a canary suite of representative prompts and compare scores against the baseline stored in PostgreSQL. The regression endpoint surfaces any evaluator where the new model underperforms the previous version.
-
-### 4. Multi-model selection
-Before committing to a model for a new feature, run the same test suite against claude, gpt-4o, and a local Ollama model. Compare cost (token count × price), latency, and eval scores side-by-side to make a data-driven selection.
-
-### 5. Safety and bias auditing
-Run demographically varied prompts through the LLM-as-judge evaluator's `safety` dimension. A systematic score difference across demographic variants is a bias signal that warrants deeper review — without requiring a separate audit tool.
-
-### 6. Customer support bot quality control
-Route a random sample of live production conversations (with PII stripped) through the evaluator as shadow traffic. Monitor hallucination rate over time. If it crosses a threshold, page on-call before customers escalate.
-
-### 7. Prompt A/B testing
-Create two test cases with identical prompts but different system prompts. Run both, compare LLM-judge scores and consistency scores. The system prompt with the higher mean score and lower consistency variance is the winner — no human review needed.
-
-### 8. Fine-tuning validation
-After fine-tuning a model on domain data, validate it doesn't hallucinate more than the base model on a held-out eval set. The hallucination detector gives a per-claim breakdown that shows exactly which types of claims the fine-tuned model fabricates.
-
----
-
-## How to Run Locally
-
-### Prerequisites
-- Docker and Docker Compose
+**Core Requirements:**
+- Docker and Docker Compose (Primary method to spin up all 5 required services)
 - An Anthropic or OpenAI API key
 
-### Step 1 — Clone and configure
+**Hardware Requirements:**
+- **RAM/Storage:** Lightweight (<1GB storage required for standard Docker images)
+- **GPU:** No GPU required for the default API-based evaluation.
+
+*(Note: Hardware requirements will increase if opting to download and run the local ML models).*
+
+**Optional (If Native/No Docker):**
+- Python 3.12+
+- PostgreSQL 16+
+- Redis 7+
+
+---
+
+## 🚀 Setup & Quick Start
+
+### 1. Clone & Configure
 ```bash
 git clone https://github.com/yourusername/llm-eval-framework
 cd llm-eval-framework
 cp .env.example .env
 ```
-
-Edit `.env` and set at minimum:
-```
+Edit `.env` and configure your API keys:
+```env
 ANTHROPIC_API_KEY=sk-ant-...
 API_KEY=your-chosen-secret
 ```
 
-### Step 2 — Start all services
+### 2. Start Services
+Ensure the Docker daemon is running, then spin up the environment:
 ```bash
 docker-compose up -d
 ```
+This single command spins up PostgreSQL, Redis, the FastAPI API, the Celery worker, and Streamlit.
 
-This starts five services: PostgreSQL, Redis, the FastAPI API, a Celery worker, and the Streamlit dashboard. Tables are created automatically on first API startup.
-
-### Step 3 — Verify everything is up
+### 3. Verify Health
 ```bash
 curl http://localhost:8000/health
 # {"status":"ok","version":"1.0.0"}
-
-curl http://localhost:8000/api/dashboard/health -H "X-API-Key: your-chosen-secret"
-# {"status":"ok","database":"ok"}
 ```
 
-### Step 4 — Submit your first test case
+### 4. Submit a Test Case
 ```bash
 curl -X POST http://localhost:8000/api/test-cases \
   -H "Content-Type: application/json" \
@@ -364,98 +156,84 @@ curl -X POST http://localhost:8000/api/test-cases \
   }'
 ```
 
-The API returns immediately. The Celery worker picks up the job within seconds.
-
-### Step 5 — Open the dashboard
-```
-http://localhost:8501
-```
-
-Check the Results tab after 15–20 seconds. Scores appear as evaluations complete.
-
-### Running without Docker
-```bash
-# Start PostgreSQL and Redis separately, then:
-pip install -r requirements.txt
-cp .env.example .env  # Edit DATABASE_URL and REDIS_URL to point to local services
-
-# Terminal 1 — API
-uvicorn src.api.main:app --reload
-
-# Terminal 2 — Worker
-celery -A src.workers.celery_app worker --loglevel=info
-
-# Terminal 3 — Dashboard
-streamlit run src/dashboard/app.py
-```
-
-### Running tests
-```bash
-pip install -r requirements.txt
-pytest tests/ -v
-```
-
-Tests use SQLite in-memory — no PostgreSQL or Redis required.
+### 5. Access the Dashboard
+Navigate to `http://localhost:8501` in your browser. Check the **Results** tab after ~15 seconds to see the completed evaluations.
 
 ---
 
-## Adding a New Evaluator
+## 🗂️ Folder Structure
 
-The pattern is three steps:
-
-**1. Create the evaluator**
-```python
-# src/evaluators/my_evaluator.py
-from .base import BaseEvaluator, EvalResult
-
-class MyEvaluator(BaseEvaluator):
-    name = "my_evaluator"
-
-    async def evaluate(self, prompt, response, context=None, reference=None, **kw) -> EvalResult:
-        score = ...  # your logic
-        return self._result(score, explanation="reason for score")
+```text
+llm-eval-framework/
+├── src/
+│   ├── config.py                   # Pydantic settings — single source of truth
+│   ├── api/
+│   │   ├── main.py                 # FastAPI app + lifespan (DB init)
+│   │   ├── deps.py                 # Reusable dependencies (DB sessions)
+│   │   ├── schemas.py              # Pydantic request/response models
+│   │   └── routers/                # API Endpoints (Test Cases, Results, Dashboard)
+│   ├── database/
+│   │   ├── models.py               # SQLAlchemy ORM schemas
+│   │   └── engine.py               # Async engine and session factory
+│   ├── evaluators/
+│   │   ├── base.py                 # Abstract BaseEvaluator class
+│   │   ├── llm_judge.py            # LLM-as-judge scoring logic
+│   │   ├── hallucination.py        # Claim-level NLI checking
+│   │   ├── faithfulness.py         # RAG context grounding check
+│   │   ├── consistency.py          # Similarity across 'N' model runs
+│   │   └── registry.py             # Instantiation factory
+│   ├── llm_clients/                # Wrappers to talk to Anthropic/OpenAI APIs
+│   ├── workers/
+│   │   ├── celery_app.py           # Celery configuration
+│   │   └── tasks.py                # background run_evaluation task
+│   └── dashboard/
+│       └── app.py                  # Streamlit UI — 4 tabs, cached data
+├── alembic/                        # Database migration scripts
+├── tests/                          # Pytest suite
+├── docker-compose.yml              # 5-service orchestration
+├── Dockerfile                      # Standardized Python container
+├── requirements.txt                # Dependency locking
+└── .env.example
 ```
-
-**2. Register it**
-```python
-# src/evaluators/registry.py
-from .my_evaluator import MyEvaluator
-
-_REGISTRY = {
-    ...
-    "my_evaluator": MyEvaluator,
-}
-```
-
-**3. Use it**
-```json
-{ "evaluators": ["llm_judge", "my_evaluator"] }
-```
-
-No other changes needed. The worker, result storage, dashboard, and API all pick it up automatically.
 
 ---
 
-## Environment Variables
+## 🛠️ Functionality (The Evaluators)
+
+1. **LLM-as-Judge:** Uses a stronger model (like Claude Haiku or GPT-4o-mini) to score the target model's response on accuracy, relevance, completeness, clarity, and safety (1-5 rubric normalized to 0.0-1.0).
+2. **Hallucination Detector:** Breaks the response into individual factual claims and asks the judge to classify each as `SUPPORTED`, `UNSUPPORTED`, or `CONTRADICTED` against a reference document.
+3. **Faithfulness Scorer (RAG Only):** Measures whether the model stayed strictly within the provided RAG context, catching "context leakage" even if the answer is factually correct.
+4. **Consistency Checker:** Runs the exact same prompt `N` times (default 5) and measures pairwise semantic similarity across all responses to flag structural or factual instability.
+
+---
+
+## 💡 Use Cases
+
+- **Prompt Regression Testing (CI/CD):** Wire the framework into GitHub Actions. Fail PRs if prompt modifications cause evaluation scores to drop below the threshold.
+- **RAG Pipeline QA:** After tuning a retriever, pass golden questions into the framework and score their Faithfulness. If faithfulness is high but hallucination is high, the source docs are wrong. If faithfulness is low, the retriever is returning junk.
+- **Model Provider Updates:** Run a canary suite against every new major OpenAI/Anthropic release to instantly detect regressions compared to the previous version.
+- **A/B Testing Prompts:** Run two identical prompts with different system instructions through the framework. The system prompt with higher Judge scores and lower Consistency variance wins.
+- **Cost / Multi-Model Selection:** Benchmark `claude` against `gpt-4o` across latency, token usage, and evaluation score to make a data-driven model choice.
+
+---
+
+## ⚙️ Configuration (Environment Variables)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `ANTHROPIC_API_KEY` | If using Claude | — | Anthropic API key |
-| `OPENAI_API_KEY` | If using OpenAI | — | OpenAI API key |
+| `ANTHROPIC_API_KEY` | Optional | | Anthropic API key |
+| `OPENAI_API_KEY` | Optional | | OpenAI API key |
 | `JUDGE_MODEL` | No | `claude-haiku-4-5-20251001` | Model used by all evaluators |
 | `JUDGE_PROVIDER` | No | `anthropic` | `anthropic` or `openai` |
-| `DATABASE_URL` | Yes | — | asyncpg connection string |
-| `CELERY_BROKER_URL` | Yes | — | Redis URL for task queue |
-| `CELERY_RESULT_BACKEND` | Yes | — | Redis URL for task results |
-| `API_KEY` | Yes | `dev-secret-key` | Header auth for all endpoints |
-| `DEFAULT_THRESHOLD` | No | `0.70` | Pass/fail cutoff for all evaluators |
-| `CONSISTENCY_RUNS` | No | `5` | Number of LLM re-runs for consistency |
-| `SLACK_WEBHOOK_URL` | No | — | Posts alert when a test case fails |
+| `DATABASE_URL` | Yes | | asyncpg connection string |
+| `CELERY_BROKER_URL`| Yes | | Redis URL for task queue |
+| `CELERY_RESULT_BACKEND`| Yes | | Redis URL for task results |
+| `API_KEY` | Yes | `dev-secret-key` | Header auth for endpoints |
+| `DEFAULT_THRESHOLD` | No | `0.70` | Pass/fail cutoff for evaluations |
+| `CONSISTENCY_RUNS` | No | `5` | Runs for the consistency checker |
+| `SLACK_WEBHOOK_URL`| No | | Webhook target to post alerts |
 
 ---
 
-## Licence
-
+## 📄 License
 MIT
-# LLM_Eval_Framework_Report
-# llm-eval-framework

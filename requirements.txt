@@ -29,6 +29,6 @@ pytest==8.3.3
 pytest-asyncio==0.24.0
 aiosqlite==0.20.0        # SQLite backend for in-memory test DB
 
-# ── Optional: local ML (comment in to enable sentence-transformer similarity) ──
-# sentence-transformers==3.1.1   # ~80 MB model, much better consistency scores
-# torch==2.4.1                   # Required by sentence-transformers
+# ✨ Optional: local ML (comment in to enable sentence-transformer similarity) ✨
+sentence-transformers==3.1.1   # ~80 MB model, much better consistency scores
+torch==2.4.1                   # Required by sentence-transformers
